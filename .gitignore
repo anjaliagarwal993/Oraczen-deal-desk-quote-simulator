@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.env.local
+backend/data/quotes.json
+node_modules/
+.next/
+backend/data/users.json
+*.tsbuildinfo
+.venv/
