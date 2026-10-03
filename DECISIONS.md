@@ -1,46 +1,449 @@
 # Decisions
 
-## The seven questions
-1. **Same product added twice?** The backend merges them into one line and adds the quantities (2 + 3 → 5). One line per SKU keeps the quote readable and the totals identical either way. Tested in `test_same_product_twice_is_merged`.
-2. **0% discount: `0` or omitted?** Always stored and returned as the number `0`. A missing field and "no discount" mean different things; a number is never ambiguous, and the type stays simple.
-3. **Money and rounding.** Money is **integer cents** end to end; discount percentages are Python `Decimal`. Floats cannot represent most decimals exactly (`0.1 + 0.2 != 0.3`), so totals could drift by a cent. The only rounding step is `discount_amount`, rounded **half-up** to the cent; total = subtotal − discount_amount, so the lines on the screen always add up. Frontend only formats cents for display.
-4. **Annual commitment: pricing or approval?** Approval only. It never changes a price; it lowers the discount that triggers approval from "above 15%" to "above 10%". The explanation text says this explicitly.
-5. **Product removed from the catalog after saving?** Each saved quote stores a **snapshot** (name, unit price, line total). Old quotes keep their original numbers. The API adds a `warnings` entry ("no longer in the catalog" / "price has changed") which the review page shows. Quotes are never silently recalculated.
-6. **Where do the rules live?** Only in `backend/app/pricing.py` (+ `workflow.py` for statuses). The frontend never computes a total, tier, approval flag or allowed transition; it sends a draft and renders the response. The approval meters only scale numbers the API returned. Tier ranges are read from `catalog.json`, not hardcoded.
-7. **Status transitions.** `draft → submitted → approved` and `draft → submitted → rejected`. Approved and rejected are final; no skipping `submitted`, no going back. Invalid moves return **409** with the allowed next statuses. Each change is appended to a history list (audit trail).
+## The seven questions and answers
+**1. What happens if the same product is added twice?**
 
-## Discount negotiation and approval
-1. **Why the requested discount does not affect pricing.** It is what the customer *wants*, not what we *offer*. If it fed the total, a customer could change a price just by asking. It is stored and shown (with the gap in percentage points) purely as negotiation context.
-2. **Why the proposed discount controls the quote.** It is the only discount the salesperson commits to, so `discount_amount`, `total`, tier validation, the approval rules and the Deal Coach all read it. `discount_pct` was renamed to `proposed_discount_pct`; the old name is still accepted on input as an alias.
-3. **Why approval uses the proposed discount.** Approval exists to control what we give away. A customer asking for 25% while we propose 15% gives nothing away, so no approval. Exactly 15% is still not "above 15%".
-4. **Why the request may exceed the tier maximum.** The tier maximum is a limit on *our* offer, not on what customers may ask. Rejecting the quote would punish the rep for the customer's ambition. The UI instead says the request is above the tier limit but the proposal is within policy. Only the request being outside 0-100 is an error.
-5. **How the approved discount works.** It stays empty ("Pending") until a manager approves. Then it is stored separately, with its own `discount_amount` and **final approved total**; the proposed figures are never overwritten. It must be 0-100, within the tier maximum, and not above the proposal. If the manager approves without typing a value it is recorded as equal to the proposal (explicitly stored, and noted in the history). It can only be set while approving, never on reject or submit.
-6. **Can approved exceed proposed? No.** Nothing in the brief supports manager-approved *increases*, and a manager raising a discount above what the rep asked for would also skip the rep's own commitment. Approval can only hold or reduce the discount. If the business wants increases later, relax `validate_approved` (one function, one test).
-7. **Old `discount_pct` records.** On read, `normalize_quote` maps `discount_pct` to `proposed_discount_pct`, and fills "no request / no approval" for the rest. Nothing is rewritten on disk, nothing becomes invalid, and the function is idempotent.
-8. **Money and rounding (unchanged).** Integer cents; percentages are `Decimal`; the only rounding is `apply_discount` (half-up to the cent). The approved figures use the same function, so the proposed and approved totals round identically.
-9. **Requested discount is optional** (`null` = not entered), not defaulting to 0, so we never claim "you are offering 15 points more than requested" when nobody entered a request.
-10. **What-if options are simulations.** Each re-runs `calculate()` on a copy of the draft; the UI only changes the form if the rep presses Apply. The "reduce the total" option has no Apply button because there is no single correct way to trim scope.
-11. **Approval logic is a pure function** (`workflow.apply_status_change`): it validates first and mutates second, so a rejected approval changes nothing, and it can be unit-tested without a web server.
-12. **API field name:** the tier maximum is still returned as `tier_max_discount_pct` (it existed before this change; the catalog rules use `max_discount_pct`).
+AGENT-CORE × 10
+AGENT-CORE × 5
 
-## Things I noticed
-- **README example vs. rule text:** the example response lists `discount_above_15_percent` for a 15% discount on $12,000, but the rule says "*above* 15%". I followed the rule: exactly 15% does **not** need approval. Same for exactly $25,000. Both boundaries are tested.
-- **STARTER can never trigger the 15% rule** (max 10%), so "above 15%" only occurs for GROWTH/ENTERPRISE. Tested.
-- **Seats vs quantity:** seats decide the tier (max discount); line quantity decides the price. They are independent.
-- Several approval reasons can apply at once (e.g. 18% with annual commitment); all are listed.
-- Validation collects *every* problem and returns them together, with plain-language messages.
-- Quantity is capped at 100,000 as a typo guard (my choice, not in the spec).
+would become:
 
-## Testing notes
-- Backend: business rules and boundaries (9/10, 49/50, 99999/100000, 15%, $25,000), rounding, validation, API errors, status workflow, catalog drift.
-- Frontend: `formatMoney` and the `isDraft` localStorage guard. With more time I'd add React Testing Library tests for the builder (error rendering, debounce) and a Playwright happy-path.
+AGENT-CORE × 15
+Why?
 
-## Limitations
-- JSON file storage: single process, whole-file rewrite on each save (lock + atomic replace). Fine for a demo, not for concurrent users.
-- Login exists (register/login, signed tokens), but every signed-in user can approve or reject any quote. In production, approving would need a manager role, and the token would live in an httpOnly cookie rather than localStorage.
+The SKU uniquely identifies a product in the catalog. Keeping one line per SKU makes the quote easier to understand and avoids duplicate product rows during pricing, export, and comparison.
 
-## With another day
-- PostgreSQL (`quotes`, `quote_lines`, `status_history` tables; snapshot columns stay) with Alembic migrations.
-- Roles: reps submit, managers approve.
-- Optimistic status updates with rollback, Docker Compose, and a React Testing Library suite.
-- Optimistic concurrency (version field) so two reviewers can't overwrite each other.
+It also makes the quote cleaner for a salesperson or manager reviewing it.
+
+
+**2. Is a 0% discount represented as 0 or omitted?**
+
+I decided to represent a 0% discount explicitly as 0.
+
+For example:
+
+{
+  "proposed_discount_pct": 0
+}
+Why?
+
+A 0% discount is a valid business value. It means that the salesperson is intentionally offering no discount.
+
+If the value were omitted, it would be unclear whether:
+
+the salesperson selected 0%, or
+the value was never provided.
+
+Representing it explicitly as 0 makes the API and stored quote data unambiguous and keeps the pricing calculation consistent.
+
+
+**3. How do you handle money and rounding?**
+
+I decided to represent monetary values internally as integer cents instead of floating-point dollar values.
+
+For example:
+
+$1,450.00 → 145000 cents
+
+The API therefore uses fields such as:
+
+subtotal_cents
+discount_amount_cents
+total_cents
+Why?
+
+Floating-point arithmetic can introduce precision issues when dealing with financial calculations.
+
+Since this application is calculating customer quotes, I wanted the same input to always produce the same monetary result.
+
+The calculation follows:
+
+Line Total = Quantity × Unit Price
+
+Subtotal = Sum of Line Totals
+
+Discount Amount = Subtotal × Discount %
+
+Total = Subtotal - Discount Amount
+
+The backend controls the monetary calculation and rounding so that the frontend does not independently calculate a different final amount.
+
+Trade-off
+
+Using integer cents makes the backend calculation reliable, but the frontend has to convert cents into dollars when displaying prices.
+
+I consider this a worthwhile trade-off because correctness is more important than keeping the internal representation visually convenient.
+
+
+**4. Does annual commitment change pricing, or only approval logic?**
+
+Annual commitment affects approval logic only. It does not automatically change the price.
+
+For example:
+
+annual_commitment = true
+
+does not automatically apply an additional discount.
+
+Instead, it is part of the approval rule:
+
+Annual commitment = true
+AND
+Proposed discount > 10%
+
+requires approval.
+
+Why?
+
+The requirements define annual commitment as an approval condition but do not specify an automatic price reduction.
+
+I therefore did not introduce an additional pricing rule that was not part of the requirements.
+
+This keeps the two concepts separate:
+
+Pricing
+→ products + quantities + proposed discount
+
+Approval
+→ proposed discount + total value + annual commitment
+
+This also makes the system easier to explain to a salesperson.
+
+
+**5. What happens if a product disappears from the catalog after a saved quote was created?**
+
+A saved quote should remain understandable even if the product later disappears from the current catalog.
+
+I decided to preserve the product information that was used when the quote was created rather than depending completely on the current catalog.
+
+If the current catalog no longer contains that product, the application can show a catalog-drift warning instead of silently deleting or replacing the old quote line.
+
+For example:
+
+Saved quote:
+AGENT-CORE
+Original unit price: $120
+
+Current catalog:
+AGENT-CORE is no longer available
+Why?
+
+A saved quote represents a historical sales decision. It should not become invalid or unreadable just because the catalog changes later.
+
+At the same time, the user should know that the saved quote and the current catalog are no longer completely aligned.
+
+Therefore, I prefer:
+
+Preserve historical quote
++
+Warn about catalog drift
+
+instead of silently changing the historical quote.
+
+
+**6. Where should business rules live so the frontend and backend cannot disagree?**
+
+The backend is the authoritative source for pricing and business rules.
+
+The FastAPI backend is responsible for:
+
+Pricing calculations
+Tier determination
+Discount validation
+Maximum discount validation
+Approval rules
+Quote validation
+Quote workflow transitions
+
+The frontend requests the calculation from the backend and displays the returned result.
+
+The flow is:
+
+Frontend
+   ↓
+POST /api/quotes/calculate
+   ↓
+FastAPI Backend
+   ↓
+Pricing + Validation + Approval Rules
+   ↓
+Calculation Result
+   ↓
+Frontend
+Why?
+
+If the frontend and backend independently implemented the same business rules, they could eventually disagree.
+
+For example:
+
+Frontend:
+20% discount is acceptable
+
+Backend:
+20% discount requires approval
+
+That would create inconsistent behavior.
+
+The backend therefore acts as the single source of truth.
+
+I also separated the backend logic into modules such as:
+
+pricing.py
+workflow.py
+explain.py
+storage.py
+main.py
+
+This keeps business rules separate from API routing and makes them easier to test.
+
+
+**7. Which status transitions are allowed?**
+
+I decided to use the following quote workflow:
+
+Draft
+  ↓
+Submitted
+  ↓
+Approved
+
+or:
+
+Draft
+  ↓
+Submitted
+  ↓
+Rejected
+
+The allowed transitions are:
+
+| Current Status | Allowed Next Status |
+| --- | --- |
+| Draft | Submitted |
+| Submitted | Approved |
+| Submitted | Rejected |
+| Approved | No further transition |
+| Rejected | No further transition |
+
+Why?
+
+A quote should not be able to move directly from Draft to Approved because it has not gone through the submission process.
+
+Similarly, once a quote has been approved or rejected, allowing arbitrary transitions would make the workflow and approval history harder to understand.
+
+The backend validates these transitions rather than relying only on frontend buttons.
+
+This is important because a user could otherwise call the API directly and bypass frontend restrictions.
+
+
+**What I Noticed While Building**
+
+
+**1. Pricing rules and approval rules are different concepts**
+
+One important observation during implementation was that the maximum discount allowed by a pricing tier is not the same thing as the approval threshold.
+
+For example:
+
+Enterprise maximum discount = 30%
+
+Approval threshold = 15%
+
+Proposed discount = 20%
+
+In this case, 20% is valid for the Enterprise tier, but it still requires approval.
+
+This distinction helped keep the pricing validation and approval logic separate.
+
+
+**2. Customer-requested discount and proposed discount should not be treated as the same value**
+
+During the implementation, I found that the customer's requested discount is mainly negotiation context, while the proposed discount is the actual commercial offer.
+
+For example:
+
+Customer requested = 22%
+Salesperson proposed = 18%
+Tier maximum = 20%
+
+The customer asking for 22% should not automatically invalidate the quote because the salesperson may choose to offer only 18%.
+
+This made it useful to keep these values separate.
+
+
+**3. The backend needs to be authoritative**
+
+The project made it clear that calculations shown in the UI should not be treated as the final source of truth.
+
+The frontend can provide a good user experience, but the backend must validate the final values before saving a quote.
+
+This is especially important for:
+
+Discounts
+Pricing
+Approval rules
+Quote status
+
+
+**4. Explainability is important for a sales tool**
+
+Instead of only showing:
+
+Approval Required
+
+the application explains why approval is required.
+
+For example:
+
+Discount exceeds the 15% approval threshold.
+
+or:
+
+Quote total exceeds $25,000.
+
+This makes the tool more useful than a simple calculator because the salesperson can understand what action is causing the approval requirement.
+
+
+**5. Scenario comparison is more useful when the differences are explained**
+
+While implementing the comparison feature, I found that simply showing two quotes side by side is not enough.
+
+The application therefore also provides a summary of what changed between Scenario A and Scenario B.
+
+This makes the comparison more useful for evaluating negotiation alternatives.
+
+
+**6. Historical quote data and current catalog data are different**
+
+A saved quote represents what was known when the quote was created, while the catalog represents the current product information.
+
+Keeping this distinction allowed me to introduce catalog-drift warnings instead of silently modifying old quotes.
+
+
+**7. JSON persistence is simple but has clear limitations**
+
+JSON files were sufficient for the assignment and made local setup very simple.
+
+However, while building the application, it became clear that a real production system would eventually need a database for:
+
+Concurrent users
+Reliable persistence
+Transactions
+Searching and filtering at scale
+Better data consistency
+
+I therefore kept the storage layer separate so that it can be replaced later.
+
+
+**What I Would Do With Another Day**
+
+If I had another day, I would focus on improvements that would make the application more production-ready rather than adding unrelated features.
+
+
+**1. Add a database**
+
+I would replace JSON persistence with PostgreSQL.
+
+This would improve:
+
+Concurrent quote creation
+Data durability
+Querying
+Transactions
+Scalability
+
+The current storage layer is already separated, so the pricing and workflow logic would not need to be redesigned completely.
+
+
+**2. Add stronger role-based access**
+
+I would introduce separate roles such as:
+
+Sales Representative
+Manager
+Admin
+
+For example:
+
+Sales representatives could create and submit quotes.
+Managers could approve or reject quotes.
+Admins could manage catalog information and users.
+
+This would make the approval workflow closer to a real internal sales system.
+
+
+**3. Add end-to-end testing**
+
+The current project has backend and frontend tests.
+
+With another day, I would add end-to-end tests for complete workflows such as:
+
+Register
+→ Login
+→ Create Quote
+→ Calculate
+→ Save
+→ Submit
+→ Approve
+
+I would also test the comparison workflow and catalog-drift scenarios end to end.
+
+
+**4. Improve catalog versioning**
+
+Currently, catalog drift can be detected and surfaced to the user.
+
+A stronger production implementation would version the catalog so that every quote could explicitly reference the catalog version used when it was created.
+
+For example:
+
+Quote #101
+Catalog Version: 2026.09
+
+This would make historical pricing easier to audit.
+
+
+**5. Add approval notifications**
+
+I would add email or internal notifications when a quote is submitted for approval.
+
+For example:
+
+Sales Representative
+        ↓
+Submit Quote
+        ↓
+Manager Notification
+        ↓
+Approve / Reject
+        ↓
+Sales Representative Notification
+
+This would make the workflow more practical for a real sales team.
+
+
+**6. Add CI/CD**
+
+I would configure GitHub Actions to automatically:
+
+Run backend tests
+Run frontend tests
+Run TypeScript checks
+Build the frontend
+Validate the project before merging
+
+This would reduce the chance of deploying code that breaks an existing feature.
+
+
+**7. Improve production monitoring**
+
+For a production deployment, I would add structured logging and monitoring for:
+
+API errors
+Authentication failures
+Quote calculation failures
+Approval workflow errors
+Application performance
+
+This would make production issues easier to identify and debug.
+
